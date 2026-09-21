@@ -1,59 +1,108 @@
-#include <stdio.h> 
-#include <stdlib.h> 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
 #include <readline/history.h>
 #include <readline/readline.h>
+
+#include "history.h"
 #include "token.h"
 #include "lexer.h"
 #include "parser.h"
 #include "expand.h"
+#include "builtin.h"
+#include "executor.h"
+
 int main(void)
 {
-    // Display a welcome banner when the shell starts
+    /* Display welcome message */
     printf("=====================================\n");
-    printf("      Shellforge \n");
+    printf("      Shellforge\n");
     printf(" A Unix Style Shell written in C\n");
     printf("=====================================\n");
 
-  token_list_t tokens;
- pipeline_t pipeline;
- 
- char *line;
+    using_history();
+
+    token_list_t tokens;
+    pipeline_t pipeline;
+
+    char *line;
 
     while (1)
     {
+        /* Read command from user */
         line = readline("shellforge$ ");
+
         if (line == NULL)
         {
             printf("\nGoodbye!\n");
             break;
         }
+
+        /* Ignore empty input */
         if (strlen(line) == 0)
         {
             free(line);
             continue;
         }
 
-         add_history(line);
-	lexer(line, &tokens);
-        token_print(&tokens);
-        
+        /* =========================
+           Milestone 1 - History
+           ========================= */
 
-	if(parser(&tokens, &pipeline))
-	{
-		expand_variables(&pipeline);
-    		pipeline_print(&pipeline);
-	}
-        
+        if (strcmp(line, "history") == 0)
+        {
+            print_history();
+            free(line);
+            continue;
+        }
+
+        add_history(line);
 
 
-        if (strcmp(line, "exit") == 0)
+        /* =========================
+           Milestone 2.1
+           Tokenization / Lexer
+           ========================= */
+
+        lexer(line, &tokens);
+
+
+        /* =========================
+           Milestone 2.2
+           Parser + Variable Expansion
+           ========================= */
+
+        if (parser(&tokens, &pipeline))
+        {
+            expand_variables(&pipeline);
+        }
+
+
+        /* =========================
+           Exit command
+           ========================= */
+
+        if (pipeline.command_count == 1 &&
+            pipeline.commands[0].argc > 0 &&
+            strcmp(pipeline.commands[0].argv[0],
+                   "exit") == 0)
         {
             free(line);
-            printf("Exiting...\n");
             break;
         }
-	free(line);
-    }    
+
+
+        /* =========================
+           Milestone 4.1
+           Pipeline Execution
+           ========================= */
+
+        execute_pipeline(&pipeline);
+
+
+        free(line);
+    }
+
     return 0;
 }
