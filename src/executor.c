@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,9 +7,69 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
 
+#include "parser.h"
 #include "executor.h"
 #include "builtin.h"
+
+
+/* =========================================================
+   MILESTONE 4.2
+   BACKGROUND PROCESS HANDLING
+   ========================================================= */
+
+static void sigchld_handler(int sig)
+{
+    int saved_errno = errno;
+
+    (void)sig;
+
+    /*
+     * Reap all completed child processes without blocking.
+     */
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+    {
+    }
+
+    errno = saved_errno;
+}
+
+
+/* ---------------------------------------------------------
+   Install SIGCHLD handler
+   --------------------------------------------------------- */
+
+void setup_background_handler(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+
+    sa.sa_handler = sigchld_handler;
+
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+
+    if (sigaction(SIGCHLD, &sa, NULL) < 0)
+    {
+        perror("sigaction SIGCHLD");
+    }
+}
+
+
+/* ---------------------------------------------------------
+   Manually reap completed background processes
+   --------------------------------------------------------- */
+
+void reap_background_processes(void)
+{
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+    {
+    }
+}
 
 
 /* =========================================================
@@ -24,13 +86,21 @@ int execute_command(command_t *cmd)
         return -1;
     }
 
-    /* Check whether it is a built-in command */
+
+    /*
+     * Built-in command
+     */
+
     if (is_builtin(cmd))
     {
         return execute_builtin(cmd);
     }
 
-    /* Create child process */
+
+    /*
+     * Create child process
+     */
+
     pid = fork();
 
     if (pid < 0)
@@ -39,7 +109,11 @@ int execute_command(command_t *cmd)
         return -1;
     }
 
-    /* Child process */
+
+    /* =====================================================
+       CHILD PROCESS
+       ===================================================== */
+
     if (pid == 0)
     {
         char *args[MAX_ARGS + 1];
@@ -51,26 +125,72 @@ int execute_command(command_t *cmd)
 
         args[cmd->argc] = NULL;
 
-        /* Execute command */
+
+        /*
+         * Execute external command
+         */
+
         execvp(args[0], args);
 
-        /* Runs only if execvp fails */
+
+        /*
+         * execvp returns only when execution fails
+         */
+
         perror(args[0]);
 
         _exit(127);
     }
 
-    /* Parent waits for child */
+
+    /* =====================================================
+       PARENT PROCESS
+       ===================================================== */
+
+
+    /*
+     * Milestone 4.2
+     *
+     * If command is a background command,
+     * do NOT wait for the child.
+     */
+
+    if (cmd->background)
+    {
+        printf("[Background PID: %d]\n", pid);
+
+        return 0;
+    }
+
+
+    /*
+     * Foreground command:
+     * parent waits until child finishes.
+     */
+
     if (waitpid(pid, &status, 0) < 0)
     {
+        /*
+         * SIGCHLD handler may have already
+         * handled a completed process.
+         */
+
+        if (errno == ECHILD)
+        {
+            return 0;
+        }
+
         perror("waitpid");
+
         return -1;
     }
+
 
     if (WIFEXITED(status))
     {
         return WEXITSTATUS(status);
     }
+
 
     if (WIFSIGNALED(status))
     {
@@ -80,6 +200,7 @@ int execute_command(command_t *cmd)
 
         return -1;
     }
+
 
     return -1;
 }
@@ -97,13 +218,19 @@ int execute_pipeline(pipeline_t *pipeline)
 
     int command_count;
 
-    /* Check pipeline */
+
+    /*
+     * Validate pipeline
+     */
+
     if (pipeline == NULL)
     {
         return -1;
     }
 
+
     command_count = pipeline->command_count;
+
 
     if (command_count == 0)
     {
@@ -118,13 +245,15 @@ int execute_pipeline(pipeline_t *pipeline)
 
     if (command_count == 1)
     {
-        return execute_command(&pipeline->commands[0]);
+        return execute_command(
+            &pipeline->commands[0]
+        );
     }
 
 
-    /*
-     * Multiple command pipeline
-     */
+    /* =====================================================
+       MULTIPLE COMMAND PIPELINE
+       ===================================================== */
 
     for (int i = 0; i < command_count; i++)
     {
@@ -132,8 +261,8 @@ int execute_pipeline(pipeline_t *pipeline)
 
 
         /*
-         * Create pipe unless this
-         * is the last command.
+         * Create a pipe unless this is
+         * the final command.
          */
 
         if (i < command_count - 1)
@@ -141,6 +270,7 @@ int execute_pipeline(pipeline_t *pipeline)
             if (pipe(pipefd) == -1)
             {
                 perror("pipe");
+
                 return -1;
             }
         }
@@ -152,9 +282,11 @@ int execute_pipeline(pipeline_t *pipeline)
 
         pids[i] = fork();
 
+
         if (pids[i] < 0)
         {
             perror("fork");
+
             return -1;
         }
 
@@ -173,7 +305,7 @@ int execute_pipeline(pipeline_t *pipeline)
              * INPUT REDIRECTION
              *
              * If this is not the first command,
-             * receive input from previous pipe.
+             * get input from previous pipe.
              */
 
             if (previous_read != -1)
@@ -182,6 +314,7 @@ int execute_pipeline(pipeline_t *pipeline)
                          STDIN_FILENO) == -1)
                 {
                     perror("dup2 input");
+
                     _exit(EXIT_FAILURE);
                 }
             }
@@ -190,7 +323,7 @@ int execute_pipeline(pipeline_t *pipeline)
             /*
              * OUTPUT REDIRECTION
              *
-             * If this is not the last command,
+             * If this is not the final command,
              * send output into current pipe.
              */
 
@@ -200,19 +333,26 @@ int execute_pipeline(pipeline_t *pipeline)
                          STDOUT_FILENO) == -1)
                 {
                     perror("dup2 output");
+
                     _exit(EXIT_FAILURE);
                 }
             }
 
 
             /*
-             * Close unnecessary file descriptors
+             * Close previous pipe
              */
 
             if (previous_read != -1)
             {
                 close(previous_read);
             }
+
+
+            /*
+             * Close current pipe descriptors
+             * after dup2().
+             */
 
             if (i < command_count - 1)
             {
@@ -222,10 +362,11 @@ int execute_pipeline(pipeline_t *pipeline)
 
 
             /*
-             * Prepare arguments for execvp
+             * Prepare command arguments
              */
 
             char *args[MAX_ARGS + 1];
+
 
             for (int j = 0;
                  j < cmd->argc;
@@ -234,11 +375,13 @@ int execute_pipeline(pipeline_t *pipeline)
                 args[j] = cmd->argv[j];
             }
 
+
             args[cmd->argc] = NULL;
 
 
             /*
-             * Built-in command inside pipeline
+             * Execute built-in command
+             * inside pipeline.
              */
 
             if (is_builtin(cmd))
@@ -246,7 +389,9 @@ int execute_pipeline(pipeline_t *pipeline)
                 int result =
                     execute_builtin(cmd);
 
-                _exit(result == 0 ? 0 : 1);
+                _exit(
+                    result == 0 ? 0 : 1
+                );
             }
 
 
@@ -258,8 +403,8 @@ int execute_pipeline(pipeline_t *pipeline)
 
 
             /*
-             * execvp only returns when
-             * execution fails.
+             * execvp returns only
+             * if execution fails.
              */
 
             perror(args[0]);
@@ -274,7 +419,7 @@ int execute_pipeline(pipeline_t *pipeline)
 
 
         /*
-         * Parent no longer needs the
+         * Parent no longer needs
          * previous pipe read end.
          */
 
@@ -285,15 +430,16 @@ int execute_pipeline(pipeline_t *pipeline)
 
 
         /*
-         * Save current pipe read end
-         * for next command.
+         * Save read side of current
+         * pipe for next command.
          */
 
         if (i < command_count - 1)
         {
             close(pipefd[1]);
 
-            previous_read = pipefd[0];
+            previous_read =
+                pipefd[0];
         }
         else
         {
@@ -302,35 +448,98 @@ int execute_pipeline(pipeline_t *pipeline)
     }
 
 
+    /* =====================================================
+       MILESTONE 4.2
+       BACKGROUND PIPELINE
+       ===================================================== */
+
+
     /*
-     * Wait for all child processes
+     * Check whether pipeline should
+     * execute in background.
+     *
+     * We use the background flag of
+     * the last command.
      */
+
+    if (pipeline->commands[
+            command_count - 1
+        ].background)
+    {
+        printf(
+            "[Background pipeline PID: %d]\n",
+            pids[command_count - 1]
+        );
+
+
+        /*
+         * Do NOT wait.
+         *
+         * SIGCHLD handler will reap
+         * completed child processes.
+         */
+
+        return 0;
+    }
+
+
+    /* =====================================================
+       FOREGROUND PIPELINE
+       ===================================================== */
 
     int final_status = 0;
 
-    for (int i = 0; i < command_count; i++)
+
+    /*
+     * Wait for all commands in pipeline.
+     */
+
+    for (int i = 0;
+         i < command_count;
+         i++)
     {
         int status;
 
-        if (waitpid(pids[i],
-                    &status,
-                    0) < 0)
+
+        if (waitpid(
+                pids[i],
+                &status,
+                0) < 0)
         {
+            /*
+             * Child may already have been
+             * collected by SIGCHLD handler.
+             */
+
+            if (errno == ECHILD)
+            {
+                continue;
+            }
+
+
             perror("waitpid");
+
             continue;
         }
 
 
         /*
-         * Save status of final command
+         * Save status of last command.
          */
 
-        if (i == command_count - 1)
+        if (i ==
+            command_count - 1)
         {
             if (WIFEXITED(status))
             {
                 final_status =
                     WEXITSTATUS(status);
+            }
+            else if (WIFSIGNALED(status))
+            {
+                final_status =
+                    128 +
+                    WTERMSIG(status);
             }
         }
     }
